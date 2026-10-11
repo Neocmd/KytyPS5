@@ -168,6 +168,56 @@ void TestMappedSrtUsesDirectReaderByDefault() {
         "cache rematerialization did not use the direct reader by default");
 }
 
+// Hosts never map the first 64 KiB, so a direct read there comes from a null table
+// pointer; it must read as zero instead of faulting.
+void TestDirectSrtReadFromNullPageIsZero() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = ExtractResourcePlan(SrtProgram(0x18u));
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {}, snapshot, specialization) &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0u},
+        "direct SRT read through a null pointer did not read as zero");
+}
+
+void TestCapturedSrtReadFromNullPageIsZero() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = ExtractResourcePlan(SrtProgram(0x18u));
+  plan.capture_specialization_reads = true;
+  uint32_t specialization_reads = 0;
+  const SrtRuntime runtime{.userdata = &specialization_reads,
+                           .read_specialization_memory = RejectSpecializationRead};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization_reads == 0 &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0u},
+        "captured SRT read through a null pointer did not read as zero");
+}
+
+void TestNativeSrtReadFromNullPageIsZero() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 2;
+  auto &block = *program.blocks[0];
+  auto *read = program.srt_reads[0].value.Instruction();
+  auto *handle = read->Arg(0).Instruction();
+  handle->SetArg(0, Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                               {Value(ScalarReg(4))})));
+  handle->SetArg(1, Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                               {Value(ScalarReg(5))})));
+  read->SetArg(1, Value(0x18u));
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.srt_code != nullptr, "user-data SRT read did not compile an x86 walker");
+  const std::array<uint32_t, 2> user_data{0u, 0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization) &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0u},
+        "native SRT read through a null pointer did not read as zero");
+}
+
 void TestNativeNestedSrtRefresh() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   std::array<uint32_t, 3> first{0u, 0x12345678u, 0xabcdef01u};
@@ -784,6 +834,9 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
+  TestDirectSrtReadFromNullPageIsZero();
+  TestCapturedSrtReadFromNullPageIsZero();
+  TestNativeSrtReadFromNullPageIsZero();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();

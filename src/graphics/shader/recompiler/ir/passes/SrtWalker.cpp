@@ -16,6 +16,22 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+namespace {
+
+// Hosts never map the first 64 KiB and guest memory is identity-mapped, so a direct read there
+// can only come from a null table pointer. Read it as zero instead of faulting.
+constexpr uint64_t NullPageEnd = 0x10000;
+
+void ReadDirect(uint64_t address, std::span<uint32_t> values) {
+	if (address < NullPageEnd) {
+		std::ranges::fill(values, 0u);
+		return;
+	}
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+}
+
+} // namespace
+
 SrtRuntime SrtReadCapture::ObservedRuntime() {
 	auto runtime = m_source;
 	runtime.userdata = this;
@@ -39,7 +55,7 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
 	} else {
-		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+		ReadDirect(address, values);
 	}
 	capture.m_ranges.emplace_back(address, values.size_bytes());
 	return true;
@@ -448,8 +464,10 @@ void CompileSrtWalker(ResourcePlan& program) {
 		code.and_(code.rdi, code.r9);
 		const auto first = reads.begin()->first;
 		const auto last = reads.rbegin()->first;
-		if (first < 0) {
-			code.mov(code.r10, -static_cast<int64_t>(first));
+		// Tables reaching into the null page, including address underflow, take the evaluator.
+		const auto lowest_table = static_cast<int64_t>(NullPageEnd) - first;
+		if (lowest_table > 0) {
+			code.mov(code.r10, lowest_table);
 			code.cmp(code.rdi, code.r10);
 			code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
 		}
@@ -691,7 +709,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		ReadDirect(address, {&word, 1});
 	}
 	result = word;
 	return true;
@@ -1090,8 +1108,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		m_context.values.resize(m_program.evaluation_value_count);
 		using Walker = bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*,
 		    ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t);
-		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
-		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
+		if (m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
+		        m_context.values.data(), m_context.generation, m_runtime.user_data.size())) {
+			return true;
+		}
+		// The evaluator reads null tables as zero and rejects every other native failure.
 	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
