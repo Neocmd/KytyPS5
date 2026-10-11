@@ -144,6 +144,29 @@ void TestFreeAndIdReuse() {
   Check(Collect(cache, 70).size() == 1, "touching a rebuilt item failed");
 }
 
+// The texture GC collects eviction candidates from the oldest end. Items it can never evict
+// sit there forever, so they must not use up the candidate limit.
+void TestCollectItemsBelowSkipsRejected() {
+  Common::LeastRecentlyUsedCache<std::string, uint64_t> cache;
+  (void)cache.Insert("pinned1", 10);
+  (void)cache.Insert("pinned2", 20);
+  (void)cache.Insert("a", 30);
+  (void)cache.Insert("b", 40);
+  (void)cache.Insert("c", 50);
+  (void)cache.Insert("young", 90);
+  const auto evictable = [](const std::string &object) { return object.rfind("pinned", 0) != 0; };
+
+  const auto limited = cache.CollectItemsBelow(60, 2, evictable);
+  Check(limited == std::vector<std::string>{"a", "b"},
+        "rejected items used up the collection limit");
+
+  const auto all = cache.CollectItemsBelow(60, 10, evictable);
+  Check(all == std::vector<std::string>{"a", "b", "c"},
+        "collection crossed the tick or dropped an accepted item");
+
+  Check(cache.CollectItemsBelow(60, 0, evictable).empty(), "a zero limit collected items");
+}
+
 } // namespace
 
 int main() {
@@ -151,6 +174,7 @@ int main() {
   TestEarlyExitCallback();
   TestTouchReordersAndSkips();
   TestFreeAndIdReuse();
+  TestCollectItemsBelowSkipsRejected();
   std::puts("LruCacheTests: all cases passed");
   return 0;
 }

@@ -1876,13 +1876,16 @@ void TextureCache::RunGarbageCollector() {
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
 		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
-		std::vector<ImageId> candidates;
-		candidates.reserve(deletions);
-		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
-		// first.
-		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
-			candidates.push_back(id);
-			return candidates.size() == deletions;
+		// Pass over images the loop below would skip: GPU-written tiled images stay at the
+		// oldest end forever and would otherwise take every candidate slot. Deleting depth
+		// recursively deletes its stencil association, so finish LRU traversal first.
+		const auto candidates = m_lru_cache.CollectItemsBelow(tick - age, deletions, [&](ImageId id) {
+			const auto* owner = m_slot_images.try_get(id);
+			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				return false;
+			}
+			return !owner->IsGpuModified() || !owner->SafeToDownload() ||
+			       (pressured && !owner->info.IsTiled());
 		});
 		for (const auto id: candidates) {
 			if (deletions == 0) {

@@ -5,6 +5,7 @@
 #include <deque>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace Common {
 
@@ -64,6 +65,24 @@ public:
 			}
 			item = next;
 		}
+	}
+
+	// Collects up to `limit` items not touched after `tick`, oldest first. Items `accept`
+	// rejects are passed over without counting against the limit, so long-lived items at the
+	// oldest end cannot hide the ones behind them.
+	template <typename Accept>
+	[[nodiscard]] std::vector<Object> CollectItemsBelow(Tick tick, size_t limit, Accept&& accept) {
+		std::vector<Object> items;
+		if (limit == 0) {
+			return items;
+		}
+		ForEachItemBelow(tick, [&](const Object& object) {
+			if (accept(object)) {
+				items.push_back(object);
+			}
+			return items.size() == limit;
+		});
+		return items;
 	}
 
 private:
